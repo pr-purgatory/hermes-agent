@@ -785,20 +785,9 @@ def prompt_dangerous_approval(command: str, description: str,
         sys.stdout.flush()
 
 
-def _get_approvals_config_section() -> dict:
-    """Read the approvals config block. Returns a dict with 'mode', 'timeout', etc."""
-    try:
-        from hermes_cli.config import load_config
-        config = load_config()
-        return config.get("approvals", {}) or {}
-    except Exception as e:
-        logger.warning("Failed to load approval config: %s", e)
-        return {}
-
-
 def _llm_approvals_explain_enabled() -> bool:
     """Check if LLM-generated explanations for dangerous commands are enabled."""
-    cfg = _get_approvals_config_section()
+    cfg = _get_approval_config()
     val = cfg.get("llm_explain", True)
     if isinstance(val, bool):
         return val
@@ -809,7 +798,7 @@ def _llm_approvals_explain_enabled() -> bool:
 
 def _llm_approvals_explain_timeout() -> int:
     """Read the LLM explanation timeout. Defaults to 8 seconds."""
-    cfg = _get_approvals_config_section()
+    cfg = _get_approval_config()
     try:
         return int(cfg.get("llm_explain_timeout", 8))
     except (ValueError, TypeError):
@@ -1063,7 +1052,15 @@ def check_dangerous_command(command: str, env_type: str,
             ),
         }
 
-    choice = prompt_dangerous_approval(command, description,
+    # Generate LLM explanation if enabled (enriches user-facing description)
+    use_explain = _llm_approvals_explain_enabled()
+    explain_timeout = _llm_approvals_explain_timeout()
+    if use_explain:
+        user_desc = _llm_explain_command(command, description, timeout=explain_timeout)
+    else:
+        user_desc = description
+
+    choice = prompt_dangerous_approval(command, user_desc,
                                        approval_callback=approval_callback)
 
     if choice == "deny":
