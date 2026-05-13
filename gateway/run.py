@@ -15154,6 +15154,8 @@ class GatewayRunner:
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
+                # Use the LLM-generated explanation when available
+                expl = approval_data.get("explanation", desc)
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids
@@ -15166,6 +15168,7 @@ class GatewayRunner:
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
+                                explanation=expl,
                                 metadata=_status_thread_metadata,
                             ),
                             _loop_for_step,
@@ -15186,7 +15189,7 @@ class GatewayRunner:
                 msg = (
                     f"⚠️ **Dangerous command requires approval:**\n"
                     f"```\n{cmd_preview}\n```\n"
-                    f"Reason: {desc}\n\n"
+                    f"Risk: {expl}\n\n"
                     f"Reply `/approve` to execute, `/approve session` to approve this pattern "
                     f"for the session, `/approve always` to approve permanently, or `/deny` to cancel."
                 )

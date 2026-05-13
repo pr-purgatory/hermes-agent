@@ -785,6 +785,98 @@ def prompt_dangerous_approval(command: str, description: str,
         sys.stdout.flush()
 
 
+def _get_approvals_config_section() -> dict:
+    """Read the approvals config block. Returns a dict with 'mode', 'timeout', etc."""
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        return config.get("approvals", {}) or {}
+    except Exception as e:
+        logger.warning("Failed to load approval config: %s", e)
+        return {}
+
+
+def _llm_approvals_explain_enabled() -> bool:
+    """Check if LLM-generated explanations for dangerous commands are enabled."""
+    cfg = _get_approvals_config_section()
+    val = cfg.get("llm_explain", True)
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return is_truthy_value(val, default=True)
+    return True
+
+
+def _llm_approvals_explain_timeout() -> int:
+    """Read the LLM explanation timeout. Defaults to 8 seconds."""
+    cfg = _get_approvals_config_section()
+    try:
+        return int(cfg.get("llm_explain_timeout", 8))
+    except (ValueError, TypeError):
+        return 8
+
+
+# Cache LLM explanations by (command, description) to avoid re-generating
+# the same explanation when a loop triggers the same pattern repeatedly.
+_llm_explain_cache: dict[tuple[str, str], str] = {}
+_llm_explain_cache_lock = threading.Lock()
+
+
+def _llm_explain_command(command: str, description: str, timeout: int = 8) -> str:
+    """Generate a natural-language explanation of why a command is dangerous.
+
+    Uses the auxiliary LLM to produce a concise, actionable risk assessment
+    for the user. Falls back to the static pattern description on any failure.
+
+    Returns a human-readable explanation string (typically 1-3 sentences).
+    """
+    # Truncate very long commands to keep the prompt manageable
+    cmd_preview = command[:500]
+    if len(command) > 500:
+        cmd_preview += f" ... ({len(command)} chars total)"
+
+    cache_key = (command, description)
+    with _llm_explain_cache_lock:
+        if cache_key in _llm_explain_cache:
+            return _llm_explain_cache[cache_key]
+
+    try:
+        from agent.auxiliary_client import call_llm
+
+        prompt = (
+            "You are a security reviewer for a terminal command. A command "
+            "was flagged by pattern matching as potentially dangerous.\n\n"
+            f"Command: ```\n{cmd_preview}\n```\n"
+            f"Flagged reason: {description}\n\n"
+            "Write a single, clear sentence explaining the ACTUAL risk to the user.\n"
+            "- If the command is likely a false positive (e.g., `python -c 'print(\"hello\")'` "
+            "flagged as 'script execution via -c flag'), say so and explain why it's probably safe.\n"
+            "- If it's genuinely risky, explain what could go wrong in plain English.\n"
+            "- Keep it to one sentence. No headings, no bullet points, no markdown.\n"
+            "Just a brief description of the risk or why it may be a false positive."
+        )
+
+        response = call_llm(
+            task="approval",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=150,
+            timeout=timeout,
+        )
+
+        explanation = (response.choices[0].message.content or "").strip()
+        if not explanation:
+            return description
+
+        with _llm_explain_cache_lock:
+            _llm_explain_cache[cache_key] = explanation
+        return explanation
+
+    except Exception as e:
+        logger.debug("LLM approval explanation failed (%s), using static description", e)
+        return description
+
+
 def _normalize_approval_mode(mode) -> str:
     """Normalize approval mode values loaded from YAML/config.
 
@@ -946,6 +1038,14 @@ def check_dangerous_command(command: str, env_type: str,
         return {"approved": True, "message": None}
 
     if is_gateway or os.getenv("HERMES_EXEC_ASK"):
+        # Generate LLM explanation if enabled
+        use_explain = _llm_approvals_explain_enabled()
+        explain_timeout = _llm_approvals_explain_timeout()
+        if use_explain:
+            explanation = _llm_explain_command(command, description, timeout=explain_timeout)
+        else:
+            explanation = description
+
         submit_pending(session_key, {
             "command": command,
             "pattern_key": pattern_key,
@@ -958,7 +1058,7 @@ def check_dangerous_command(command: str, env_type: str,
             "command": command,
             "description": description,
             "message": (
-                f"⚠️ This command is potentially dangerous ({description}). "
+                f"⚠️ This command is potentially dangerous ({explanation}). "
                 f"Asking the user for approval.\n\n**Command:**\n```\n{command}\n```"
             ),
         }
@@ -1150,6 +1250,15 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Combine descriptions for a single approval prompt
     combined_desc = "; ".join(desc for _, desc, _ in warnings)
+
+    # Generate LLM explanation if enabled (replaces combined_desc for user display)
+    use_explain = _llm_approvals_explain_enabled()
+    explain_timeout = _llm_approvals_explain_timeout()
+    if use_explain:
+        user_desc = _llm_explain_command(command, combined_desc, timeout=explain_timeout)
+    else:
+        user_desc = combined_desc
+
     primary_key = warnings[0][0]
     all_keys = [key for key, _, _ in warnings]
     has_tirith = any(is_t for _, _, is_t in warnings)
@@ -1172,6 +1281,7 @@ def check_all_command_guards(command: str, env_type: str,
                 "pattern_key": primary_key,
                 "pattern_keys": all_keys,
                 "description": combined_desc,
+                "explanation": user_desc,
             }
             entry = _ApprovalEntry(approval_data)
             with _lock:
